@@ -6,8 +6,10 @@ import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 typedef Widget ImageWidgetBuilder(
     BuildContext context, ImageProvider imageProvider);
 typedef Widget PlaceholderWidgetBuilder(BuildContext context, String url);
+typedef Widget ProgressIndicatorBuilder(
+    BuildContext context, String url, DownloadProgress progress);
 typedef Widget LoadingErrorWidgetBuilder(
-    BuildContext context, String url, Object error);
+    BuildContext context, String url, dynamic error);
 
 class CachedNetworkImage extends StatefulWidget {
   /// Option to use cachemanager with other settings
@@ -21,6 +23,9 @@ class CachedNetworkImage extends StatefulWidget {
 
   /// Widget displayed while the target [imageUrl] is loading.
   final PlaceholderWidgetBuilder placeholder;
+
+  /// Widget displayed while the target [imageUrl] is loading.
+  final ProgressIndicatorBuilder progressIndicatorBuilder;
 
   /// Widget displayed while the target [imageUrl] failed loading.
   final LoadingErrorWidgetBuilder errorWidget;
@@ -136,22 +141,23 @@ class CachedNetworkImage extends StatefulWidget {
     @required this.imageUrl,
     this.imageBuilder,
     this.placeholder,
+    this.progressIndicatorBuilder,
     this.errorWidget,
-    this.fadeOutDuration: const Duration(milliseconds: 1000),
-    this.fadeOutCurve: Curves.easeOut,
-    this.fadeInDuration: const Duration(milliseconds: 500),
-    this.fadeInCurve: Curves.easeIn,
+    this.fadeOutDuration = const Duration(milliseconds: 1000),
+    this.fadeOutCurve = Curves.easeOut,
+    this.fadeInDuration = const Duration(milliseconds: 500),
+    this.fadeInCurve = Curves.easeIn,
     this.width,
     this.height,
     this.fit,
-    this.alignment: Alignment.center,
-    this.repeat: ImageRepeat.noRepeat,
-    this.matchTextDirection: false,
+    this.alignment = Alignment.center,
+    this.repeat = ImageRepeat.noRepeat,
+    this.matchTextDirection = false,
     this.httpHeaders,
     this.cacheManager,
-    this.useOldImageOnUrlChange: false,
+    this.useOldImageOnUrlChange = false,
     this.color,
-    this.filterQuality: FilterQuality.low,
+    this.filterQuality = FilterQuality.low,
     this.colorBlendMode,
     this.placeholderFadeInDuration,
   })  : assert(imageUrl != null),
@@ -173,6 +179,7 @@ class CachedNetworkImage extends StatefulWidget {
 
 class _ImageTransitionHolder {
   final FileInfo image;
+  final DownloadProgress progress;
   AnimationController animationController;
   final Object error;
   Curve curve;
@@ -180,12 +187,13 @@ class _ImageTransitionHolder {
 
   _ImageTransitionHolder({
     this.image,
+    this.progress,
     @required this.animationController,
     this.error,
-    this.curve: Curves.easeIn,
+    this.curve = Curves.easeIn,
   }) : forwardTickerFuture = animationController.forward();
 
-  dispose() {
+  void dispose() {
     if (animationController != null) {
       animationController.dispose();
       animationController = null;
@@ -195,12 +203,20 @@ class _ImageTransitionHolder {
 
 class CachedNetworkImageState extends State<CachedNetworkImage>
     with TickerProviderStateMixin {
-  List<_ImageTransitionHolder> _imageHolders = List();
+  final _imageHolders = <_ImageTransitionHolder>[];
   Key _streamBuilderKey = UniqueKey();
+  Stream<FileResponse> _fileResponseStream;
+  FileInfo _fromMemory;
 
   @override
   Widget build(BuildContext context) {
     return _animatedWidget();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _createFileStream();
   }
 
   @override
@@ -211,6 +227,7 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
         _disposeImageHolders();
         _imageHolders.clear();
       }
+      _createFileStream();
     }
     super.didUpdateWidget(oldWidget);
   }
@@ -221,83 +238,119 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
     super.dispose();
   }
 
-  _disposeImageHolders() {
+  void _createFileStream() {
+    _fromMemory = _cacheManager().getFileFromMemory(widget.imageUrl);
+
+    _fileResponseStream = _cacheManager()
+        .getFileStream(
+          widget.imageUrl,
+          headers: widget.httpHeaders,
+          withProgress: widget.progressIndicatorBuilder != null,
+        )
+        // ignore errors if not mounted
+        .handleError(() {}, test: (_) => !mounted)
+        .where((f) {
+      if (f is FileInfo) {
+        return f?.originalUrl != _fromMemory?.originalUrl ||
+            f?.validTill != _fromMemory?.validTill;
+      }
+      return true;
+    });
+  }
+
+  void _disposeImageHolders() {
     for (var imageHolder in _imageHolders) {
       imageHolder.dispose();
     }
   }
 
-  _addImage({FileInfo image, Object error, Duration duration}) {
-    if (_imageHolders.length > 0) {
+  void _addImage(
+      {FileInfo image,
+      DownloadProgress progress,
+      Object error,
+      Duration duration}) {
+    if (_imageHolders.isNotEmpty) {
       var lastHolder = _imageHolders.last;
-      lastHolder.forwardTickerFuture.then((_) {
-        if (lastHolder.animationController == null) {
-          return;
-        }
-        if (widget.fadeOutDuration != null) {
-          lastHolder.animationController.duration = widget.fadeOutDuration;
-        } else {
-          lastHolder.animationController.duration = Duration(seconds: 1);
-        }
-        if (widget.fadeOutCurve != null) {
-          lastHolder.curve = widget.fadeOutCurve;
-        } else {
-          lastHolder.curve = Curves.easeOut;
-        }
-        lastHolder.animationController.reverse().then((_) {
-          _imageHolders.remove(lastHolder);
-          if (mounted) setState(() {});
-          return null;
+      if (lastHolder.progress != null && progress != null) {
+        _imageHolders.removeLast();
+      } else {
+        lastHolder.forwardTickerFuture.then((_) {
+          if (lastHolder.animationController == null) {
+            return;
+          }
+          if (widget.fadeOutDuration != null) {
+            lastHolder.animationController.duration = widget.fadeOutDuration;
+          } else {
+            lastHolder.animationController.duration =
+                const Duration(seconds: 1);
+          }
+          if (widget.fadeOutCurve != null) {
+            lastHolder.curve = widget.fadeOutCurve;
+          } else {
+            lastHolder.curve = Curves.easeOut;
+          }
+          lastHolder.animationController.reverse().then((_) {
+            _imageHolders.remove(lastHolder);
+            if (mounted) setState(() {});
+            return null;
+          });
         });
-      });
+      }
     }
     _imageHolders.add(
       _ImageTransitionHolder(
         image: image,
         error: error,
+        progress: progress,
         animationController: AnimationController(
           vsync: this,
           duration: duration ??
-              (widget.fadeInDuration ?? Duration(milliseconds: 500)),
+              (widget.fadeInDuration ?? const Duration(milliseconds: 500)),
         ),
       ),
     );
   }
 
-  _animatedWidget() {
-    var fromMemory = _cacheManager().getFileFromMemory(widget.imageUrl);
-
-    return StreamBuilder<FileInfo>(
+  Widget _animatedWidget() {
+    return StreamBuilder<FileResponse>(
       key: _streamBuilderKey,
-      initialData: fromMemory,
-      stream: _cacheManager()
-          .getFile(widget.imageUrl, headers: widget.httpHeaders)
-          // ignore errors if not mounted
-          .handleError(() {}, test: (_) => !mounted)
-          .where((f) =>
-              f?.originalUrl != fromMemory?.originalUrl ||
-              f?.validTill != fromMemory?.validTill),
-      builder: (BuildContext context, AsyncSnapshot<FileInfo> snapshot) {
+      initialData: _fromMemory,
+      stream: _fileResponseStream,
+      builder: (BuildContext context, AsyncSnapshot<FileResponse> snapshot) {
         if (snapshot.hasError) {
           // error
-          if (_imageHolders.length == 0 || _imageHolders.last.error == null) {
+          if (_imageHolders.isEmpty || _imageHolders.last.error == null) {
             _addImage(image: null, error: snapshot.error);
           }
         } else {
-          var fileInfo = snapshot.data;
-          if (fileInfo == null) {
+          var fileResponse = snapshot.data;
+          if (fileResponse == null) {
             // placeholder
-            if (_imageHolders.length == 0 || _imageHolders.last.image != null) {
+            if (_imageHolders.isEmpty || _imageHolders.last.image != null) {
+              DownloadProgress progress;
+              if (widget.progressIndicatorBuilder != null) {
+                progress = DownloadProgress(widget.imageUrl, null, 0);
+              }
               _addImage(
+                  progress: progress,
                   image: null,
                   duration: widget.placeholderFadeInDuration ?? Duration.zero);
             }
-          } else if (_imageHolders.length == 0 ||
-              _imageHolders.last.image?.originalUrl != fileInfo.originalUrl ||
-              _imageHolders.last.image?.validTill != fileInfo.validTill) {
-            _addImage(
-                image: fileInfo,
-                duration: _imageHolders.length > 0 ? null : Duration.zero);
+          } else {
+            if (fileResponse is FileInfo) {
+              if (_imageHolders.isEmpty ||
+                  _imageHolders.last.image?.originalUrl !=
+                      fileResponse.originalUrl ||
+                  _imageHolders.last.image?.validTill !=
+                      fileResponse.validTill) {
+                _addImage(
+                    image: fileResponse,
+                    duration: _imageHolders.isNotEmpty ? null : Duration.zero);
+              }
+            }
+            if (fileResponse is DownloadProgress) {
+              _addImage(progress: fileResponse, duration: Duration.zero);
+            }
           }
         }
 
@@ -306,15 +359,26 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
           if (holder.error != null) {
             children.add(_transitionWidget(
                 holder: holder, child: _errorWidget(context, holder.error)));
+          } else if (holder.progress != null) {
+            children.add(_transitionWidget(
+                holder: holder,
+                child: widget.progressIndicatorBuilder(
+                  context,
+                  holder.progress.originalUrl,
+                  holder.progress,
+                )));
           } else if (holder.image == null) {
             children.add(_transitionWidget(
                 holder: holder, child: _placeholder(context)));
           } else {
             children.add(_transitionWidget(
                 holder: holder,
-                child: _image(
-                  context,
-                  FileImage(holder.image.file),
+                child: KeyedSubtree(
+                  key: Key(holder.image.file.path),
+                  child: _image(
+                    context,
+                    FileImage(holder.image.file),
+                  ),
                 )));
           }
         }
@@ -340,7 +404,7 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
     return widget.cacheManager ?? DefaultCacheManager();
   }
 
-  _image(BuildContext context, ImageProvider imageProvider) {
+  Widget _image(BuildContext context, ImageProvider imageProvider) {
     return widget.imageBuilder != null
         ? widget.imageBuilder(context, imageProvider)
         : Image(
@@ -357,7 +421,7 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
           );
   }
 
-  _placeholder(BuildContext context) {
+  Widget _placeholder(BuildContext context) {
     return widget.placeholder != null
         ? widget.placeholder(context, widget.imageUrl)
         : SizedBox(
@@ -366,7 +430,7 @@ class CachedNetworkImageState extends State<CachedNetworkImage>
           );
   }
 
-  _errorWidget(BuildContext context, Object error) {
+  Widget _errorWidget(BuildContext context, Object error) {
     return widget.errorWidget != null
         ? widget.errorWidget(context, widget.imageUrl, error)
         : _placeholder(context);
